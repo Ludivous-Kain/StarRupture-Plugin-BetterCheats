@@ -1,5 +1,7 @@
 #include "player_inventory.h"
 #include "plugin_helpers.h"
+#include "plugin_config.h"
+#include "keybind_picker.h"
 #include "game_context.h"
 #include "session_config.h"
 
@@ -10,6 +12,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 
 // Resizing the player inventory is generated-SDK only: no AOB patterns, no
@@ -23,9 +26,11 @@
 // shrinking every slot widget by the same factor keeps the footprint. Do one
 // without the other and the grid overflows sideways instead of downwards.
 //
-// Everything that touches a UObject runs on the game thread — Tick(), or the
-// console handler, which is registered with gameThread = true. RenderImGui()
-// runs on the render thread and only ever reads the snapshot.
+// Resize and slot-scale maintain run only after the maintain keybind: immediately
+// on press, then every engine tick for a short burst. Steppers and the console
+// command only queue the wanted grid. Everything that touches a UObject runs on
+// the game thread — Tick(), or the console handler (gameThread = true).
+// RenderImGui() runs on the render thread and only ever reads the snapshot.
 
 namespace BetterCheats::Panels::Inventory
 {
@@ -45,11 +50,8 @@ namespace BetterCheats::Panels::Inventory
 		// Neither half stays applied on its own: the game rebuilds every slot
 		// widget whenever the inventory resizes, so the sizes have to be put back
 		// afterwards, and the widgets only exist once the inventory is opened.
-		constexpr float kMaintainInterval = 0.5f;
-
-		// ResizeInventory can refuse (see ResizeGrid). Retrying an RPC forever at
-		// 2 Hz is worse than leaving the grid the shape it is.
-		constexpr int kMaxResizeAttempts = 3;
+		// The maintain keybind is the only thing that starts that work.
+		constexpr float kBurstSeconds = 3.0f;
 
 		constexpr const char* kCommandName  = "bc_invsize";
 		constexpr const char* kCommandAlias = "invsize";
@@ -359,21 +361,17 @@ namespace BetterCheats::Panels::Inventory
 		std::atomic<bool> g_wantFitToPanel{ true };
 		std::atomic<bool> g_pendingResize{ false };
 
+		// Input thread writes this; Tick consumes it on the game thread so the
+		// first burst pass runs on the next engine tick rather than from the
+		// key callback (which is not safe for UObject traffic).
+		std::atomic<bool> g_burstRequested{ false };
+
 		// ---------------------------------------------------------------------
 		// Applied state — game thread only.
 		// ---------------------------------------------------------------------
-		float g_maintainTimer    = 0.0f;
-		float g_appliedSlotScale = 1.0f;
-		int   g_resizeAttempts   = 0;
-		int   g_resizeTarget     = 0; // the shape the attempts were counted for
-
-		// A miss costs a full GObjects walk, and the widget does not exist at all
-		// until the inventory is opened for the first time, so a miss is the
-		// normal case for most of a session. Back off hard between attempts —
-		// see enemies.cpp, where walking GObjects too often was itself the
-		// framerate drop it looked like it was diagnosing.
-		constexpr float kRescanCooldown = 5.0f;
-		float g_rescanCooldown = 0.0f;
+		float g_maintainRemaining = 0.0f;
+		float g_appliedSlotScale  = 1.0f;
+		bool  g_rescannedThisBurst = false;
 
 		void ApplyPendingResize()
 		{
@@ -397,8 +395,6 @@ namespace BetterCheats::Panels::Inventory
 					return; // stays pending: the pawn may not be possessed yet
 
 				g_pendingResize.store(false);
-				g_resizeAttempts = 0;
-				g_resizeTarget   = columns * 1000 + rows;
 
 				if (ResizeGrid(inv, columns, rows))
 					LOG_INFO("Inventory: grid set to %d x %d (%d slots).", columns, rows, columns * rows);
@@ -413,13 +409,9 @@ namespace BetterCheats::Panels::Inventory
 		// Re-asserts both halves. The grid can be reshaped underneath us — the
 		// corporation-reward unlock path calls ResizeInventory itself — and the
 		// slot widgets are rebuilt at their designer size every time that happens.
-		void MaintainGrid(float deltaSeconds)
+		// Called only while a key-started burst is active.
+		void MaintainGrid()
 		{
-			g_maintainTimer += deltaSeconds;
-			if (g_maintainTimer < kMaintainInterval)
-				return;
-			g_maintainTimer = 0.0f;
-
 			SDK::UCrInventoryComponent* inv = GetLocalInventory();
 			if (!inv)
 				return;
@@ -427,13 +419,13 @@ namespace BetterCheats::Panels::Inventory
 			const bool fit = g_wantFitToPanel.load();
 
 			// Nothing to find the widget for while the slots are already the size
-			// the game made them.
+			// the game made them. One GObjects walk per burst — walking it every
+			// tick is the framerate drop this used to look like it was diagnosing.
 			if ((fit || g_appliedSlotScale != 1.0f) && !ValidateContainer())
 			{
-				g_rescanCooldown -= kMaintainInterval;
-				if (g_rescanCooldown <= 0.0f)
+				if (!g_rescannedThisBurst)
 				{
-					g_rescanCooldown = kRescanCooldown;
+					g_rescannedThisBurst = true;
 					RescanContainer();
 				}
 			}
@@ -454,35 +446,10 @@ namespace BetterCheats::Panels::Inventory
 				g_wantRows.store(rows);
 			}
 
-			// Keyed on the shape, not the slot count: 16x8 and 8x16 are the same
-			// total but different requests, and the second one deserves its own
-			// attempts rather than inheriting the first one's.
-			if (g_resizeTarget != columns * 1000 + rows)
-			{
-				g_resizeTarget   = columns * 1000 + rows;
-				g_resizeAttempts = 0;
-			}
-
+			// The burst window is the retry budget: keep asking until the game
+			// accepts the shape or the 3 seconds end.
 			if (inv->GridColumns != columns || inv->GridRows != rows)
-			{
-				if (g_resizeAttempts < kMaxResizeAttempts)
-				{
-					++g_resizeAttempts;
-					ResizeGrid(inv, columns, rows);
-
-					if (g_resizeAttempts == kMaxResizeAttempts)
-					{
-						LOG_WARN("Inventory: the game would not resize the grid to %d x %d "
-							"(currently %d x %d, %d slots) — it will not shrink below the "
-							"slots that are in use.",
-							columns, rows, inv->GridColumns, inv->GridRows, inv->Slots.Num());
-					}
-				}
-			}
-			else
-			{
-				g_resizeAttempts = 0;
-			}
+				ResizeGrid(inv, columns, rows);
 
 			// Scaled against the grid the game actually built, not the one that
 			// was asked for — a refused resize should not shrink the slots.
@@ -506,8 +473,8 @@ namespace BetterCheats::Panels::Inventory
 		//
 		// The cost of leaving them is cosmetic and self-correcting — the game
 		// rebuilds every slot widget at its designer size the next time the
-		// inventory is resized. Turning the fit toggle off restores them properly,
-		// on a tick, while the plugin is still alive.
+		// inventory is resized. Turning the fit toggle off restores them properly
+		// on the next maintain burst, while the plugin is still alive.
 		void ForgetWidgets()
 		{
 			g_appliedSlotScale = 1.0f;
@@ -633,7 +600,8 @@ namespace BetterCheats::Panels::Inventory
 				SessionConfig::Set("playerInventory.rows", rows);
 
 				console->Printf(sink, PluginConsoleLineKind::Output,
-					"Inventory grid set to %d x %d (%d slots).", columns, rows, columns * rows);
+					"Queued %d x %d (%d slots). Press the inventory maintain key to apply.",
+					columns, rows, columns * rows);
 			}
 			catch (...)
 			{
@@ -644,8 +612,7 @@ namespace BetterCheats::Panels::Inventory
 
 		// ---------------------------------------------------------------------
 		// "Columns  [-] 12 [+]" stepper. Returns true on the frame the value
-		// changed, so the caller can resize on the click rather than behind an
-		// Apply button.
+		// changed, so the caller can queue a resize for the next maintain burst.
 		//
 		// Laid out on absolute offsets from the start of the line so the [+]
 		// button does not shuffle sideways as the number gains a digit.
@@ -693,38 +660,96 @@ namespace BetterCheats::Panels::Inventory
 
 			return changed;
 		}
+
+		std::mutex g_keyMutex;
+		char       g_maintainKey[64] = "";
+
+		void ReadMaintainKey(char* out, size_t outSize)
+		{
+			std::lock_guard<std::mutex> lock(g_keyMutex);
+			snprintf(out, outSize, "%s", g_maintainKey);
+		}
+
+		void OnMaintainKeyPressed(EModKey /*key*/, EModKeyEvent /*event*/)
+		{
+			if (!GameContext::IsInChimeraMain() || !GameContext::AreCheatsAllowed())
+				return;
+
+			g_burstRequested.store(true);
+		}
+
+		void ApplyMaintainKey(const char* combo)
+		{
+			IPluginSelf* self = GetSelf();
+			if (!self || !self->hooks || !self->hooks->Input || !combo || !*combo)
+				return;
+
+			char previous[64];
+			{
+				std::lock_guard<std::mutex> lock(g_keyMutex);
+				if (strcmp(g_maintainKey, combo) == 0)
+					return;
+
+				snprintf(previous, sizeof(previous), "%s", g_maintainKey);
+				snprintf(g_maintainKey, sizeof(g_maintainKey), "%s", combo);
+			}
+
+			if (previous[0])
+				self->hooks->Input->UnregisterKeybindByName(previous, EModKeyEvent::Pressed, &OnMaintainKeyPressed);
+
+			self->hooks->Input->RegisterKeybindByName(combo, EModKeyEvent::Pressed, &OnMaintainKeyPressed);
+			BetterCheatsConfig::Config::SetInventoryMaintainKey(combo);
+
+			LOG_INFO("Inventory: maintain keybind is now %s.", combo);
+		}
 	}
 
 	void Initialize()
 	{
 		IPluginSelf* self = GetSelf();
-		if (!self || !self->hooks || !self->hooks->Console)
+		if (!self || !self->hooks)
+			return;
+
+		if (self->hooks->Console)
+		{
+			PluginConsoleCommandDesc desc{};
+			desc.name       = kCommandName;
+			desc.aliases    = kCommandAlias;
+			desc.usage      = "bc_invsize <columns> <rows>";
+			desc.help       = "Resize the player inventory grid. Minimum 8 x 8.";
+			desc.handler    = &HandleInvSize;
+			desc.userData   = self;
+			desc.gameThread = true;
+
+			g_commandRegistered = self->hooks->Console->RegisterCommand(self, &desc);
+
+			// Command names are global across every plugin, so a taken alias sinks the
+			// whole registration — retry on the prefixed name alone before giving up.
+			if (!g_commandRegistered)
+			{
+				desc.aliases = nullptr;
+				g_commandRegistered = self->hooks->Console->RegisterCommand(self, &desc);
+			}
+
+			if (!g_commandRegistered)
+				LOG_WARN("Inventory: console command '%s' is already taken.", kCommandName);
+		}
+		else
 		{
 			LOG_WARN("Inventory: console unavailable, '%s' not registered.", kCommandName);
+		}
+
+		if (!self->hooks->Input)
 			return;
-		}
 
-		PluginConsoleCommandDesc desc{};
-		desc.name       = kCommandName;
-		desc.aliases    = kCommandAlias;
-		desc.usage      = "bc_invsize <columns> <rows>";
-		desc.help       = "Resize the player inventory grid. Minimum 8 x 8.";
-		desc.handler    = &HandleInvSize;
-		desc.userData   = self;
-		desc.gameThread = true;
-
-		g_commandRegistered = self->hooks->Console->RegisterCommand(self, &desc);
-
-		// Command names are global across every plugin, so a taken alias sinks the
-		// whole registration — retry on the prefixed name alone before giving up.
-		if (!g_commandRegistered)
 		{
-			desc.aliases = nullptr;
-			g_commandRegistered = self->hooks->Console->RegisterCommand(self, &desc);
+			std::lock_guard<std::mutex> lock(g_keyMutex);
+			snprintf(g_maintainKey, sizeof(g_maintainKey), "%s", BetterCheatsConfig::Config::GetInventoryMaintainKey());
 		}
 
-		if (!g_commandRegistered)
-			LOG_WARN("Inventory: console command '%s' is already taken.", kCommandName);
+		char combo[64];
+		ReadMaintainKey(combo, sizeof(combo));
+		self->hooks->Input->RegisterKeybindByName(combo, EModKeyEvent::Pressed, &OnMaintainKeyPressed);
 	}
 
 	void Shutdown()
@@ -735,13 +760,44 @@ namespace BetterCheats::Panels::Inventory
 
 		g_commandRegistered = false;
 
+		if (self && self->hooks && self->hooks->Input)
+		{
+			char combo[64];
+			ReadMaintainKey(combo, sizeof(combo));
+			if (combo[0])
+				self->hooks->Input->UnregisterKeybindByName(combo, EModKeyEvent::Pressed, &OnMaintainKeyPressed);
+		}
+
+		g_burstRequested.store(false);
+		g_maintainRemaining = 0.0f;
 		ForgetWidgets();
 	}
 
 	void Tick(float deltaSeconds)
 	{
-		ApplyPendingResize();
-		MaintainGrid(deltaSeconds);
+		if (g_burstRequested.exchange(false))
+		{
+			g_maintainRemaining  = kBurstSeconds;
+			g_rescannedThisBurst = false;
+		}
+
+		if (g_maintainRemaining > 0.0f)
+		{
+			try
+			{
+				ApplyPendingResize();
+				MaintainGrid();
+			}
+			catch (...)
+			{
+				LOG_ERROR("Inventory: exception while applying the inventory burst.");
+			}
+
+			g_maintainRemaining -= deltaSeconds;
+			if (g_maintainRemaining < 0.0f)
+				g_maintainRemaining = 0.0f;
+		}
+
 		RefreshSnapshot();
 	}
 
@@ -789,15 +845,17 @@ namespace BetterCheats::Panels::Inventory
 
 		imgui->SeparatorText("Inventory Grid");
 
+		char buffer[192];
+		char currentKey[64];
+		ReadMaintainKey(currentKey, sizeof(currentKey));
+
 		if (!snap.inventoryFound)
 		{
 			imgui->TextDisabled("Player inventory not found.");
-			return;
 		}
-
-		char buffer[192];
-
-		if (imgui->BeginTable("##inventory_grid_table", 2, kTableFlags))
+		else
+		{
+			if (imgui->BeginTable("##inventory_grid_table", 2, kTableFlags))
 		{
 			imgui->TableSetupColumn("Property", kColumnFixed, 150.0f);
 			imgui->TableSetupColumn("Value",    0,            0.0f);
@@ -824,7 +882,7 @@ namespace BetterCheats::Panels::Inventory
 			}
 			else
 			{
-				imgui->TextDisabled("Open the inventory once to scale it.");
+				imgui->TextDisabled("Open the inventory, then press the apply key.");
 			}
 
 			imgui->EndTable();
@@ -899,5 +957,32 @@ namespace BetterCheats::Panels::Inventory
 
 		imgui->Spacing();
 		imgui->TextDisabled("Console: bc_invsize <columns> <rows>");
+		}
+
+		imgui->Spacing();
+		imgui->SeparatorText("Keybind");
+
+		imgui->AlignTextToFramePadding();
+		imgui->Text("Apply inventory size");
+		imgui->SameLine(0.0f, 8.0f);
+
+		char picked[64];
+		if (Keybind::RenderPicker(imgui, "inventory_maintain_key", currentKey, picked, sizeof(picked)))
+			ApplyMaintainKey(picked);
+
+		imgui->SameLine(0.0f, 8.0f);
+		if (imgui->Button("Reset"))
+		{
+			Keybind::CancelCapture();
+			ApplyMaintainKey(BetterCheatsConfig::kDefaultInventoryMaintainKey);
+		}
+
+		imgui->Spacing();
+		snprintf(buffer, sizeof(buffer), "Open the inventory, then press %s to apply the queued grid size and slot scale for %.0f seconds.",
+			currentKey[0] ? currentKey : "the bind", kBurstSeconds);
+		imgui->TextWrapped(buffer);
+
+		imgui->Spacing();
+		imgui->TextDisabled("Modifiers count: hold Ctrl, Shift or Alt while pressing the key to bind a combo.");
 	}
 }

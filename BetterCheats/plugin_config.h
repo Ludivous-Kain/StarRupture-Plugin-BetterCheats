@@ -7,6 +7,7 @@ namespace BetterCheatsConfig
 	// F9 rather than a higher function key: F11 is the OS-level fullscreen
 	// toggle in most windowed contexts, and F12 is Steam's screenshot bind.
 	constexpr const char* kDefaultNoClipKey = "F9";
+	constexpr const char* kDefaultInventoryMaintainKey = "Tab";
 
 	static const ConfigEntry CONFIG_ENTRIES[] = {
 		{
@@ -36,6 +37,13 @@ namespace BetterCheatsConfig
 			ConfigValueType::Keybind,
 			kDefaultNoClipKey,
 			"Key to toggle No Clip on / off without opening the menu"
+		},
+		{
+			"Keybinds",
+			"InventoryMaintainKey",
+			ConfigValueType::Keybind,
+			kDefaultInventoryMaintainKey,
+			"Key to apply the inventory grid size and slot scale for 3 seconds"
 		}
 	};
 
@@ -98,6 +106,22 @@ namespace BetterCheatsConfig
 				return false;
 
 			return s_self->config->WriteString(s_self, "Keybinds", "NoClipKey", combo);
+		}
+
+		static const char* GetInventoryMaintainKey()
+		{
+			static char buffer[64];
+			if (s_self && s_self->config->ReadString(s_self, "Keybinds", "InventoryMaintainKey", buffer, sizeof(buffer), kDefaultInventoryMaintainKey))
+				return buffer;
+			return kDefaultInventoryMaintainKey;
+		}
+
+		static bool SetInventoryMaintainKey(const char* combo)
+		{
+			if (!s_self || !combo || !*combo)
+				return false;
+
+			return s_self->config->WriteString(s_self, "Keybinds", "InventoryMaintainKey", combo);
 		}
 
 	private:

@@ -4,21 +4,21 @@
 
 namespace BetterCheats::Panels::Inventory
 {
-	// Registers the "bc_invsize" console command — call once during plugin init.
+	// Registers the console command and the maintain keybind — call once during
+	// plugin init.
 	void Initialize();
 
-	// Unregisters the console command — call once during plugin shutdown.
+	// Unregisters both — call once during plugin shutdown.
 	void Shutdown();
 
-	// Applies any queued resize and refreshes the panel snapshot — call once per
-	// engine tick.
+	// While a maintain burst is active, applies the queued resize and re-asserts
+	// slot scale every tick. Otherwise only refreshes the panel snapshot.
 	void Tick(float deltaSeconds);
 
 	void RenderImGui(IModLoaderImGui* imgui);
 
 	// Restores the target slot count persisted in the active session's JSON
-	// config (see session_config.h). Only seeds the UI field — growing the
-	// inventory already persists in the save itself, so nothing is re-applied.
-	// Call on the game thread after SessionConfig::Reload().
+	// config (see session_config.h). Only queues the wanted grid — apply it with
+	// the maintain keybind. Call on the game thread after SessionConfig::Reload().
 	void ApplySavedConfig();
 }

@@ -30,7 +30,7 @@ Continuous effects (e.g. attribute locks, power overrides, wave control) are enf
 
 The inventory frame doesn't scroll, so a taller grid just runs off the bottom of it. **Shrink slots to fit the inventory frame** scales every slot widget down against that 8 x 8 reference: 8 x 8 draws at 100%, 16 x 16 at 50%, 20 x 20 at 40%. The same factor applies to both axes, so slots stay square and a wide, short grid leaves space below it rather than stretching. Slots stop shrinking at 40%; past 20 x 20 the grid overflows rather than becoming unreadable.
 
-The grid and the fit setting are saved per session and re-applied on load. The same resize is available from the mod console as `bc_invsize <columns> <rows>`.
+The grid and the fit setting are saved per session. Steppers and `bc_invsize <columns> <rows>` only queue the wanted size — open the inventory and press **Tab** (default) to apply it immediately, then every tick for 3 seconds. Rebind that key from the **Player -> Inventory** panel, holding Ctrl, Shift or Alt for a combo.
 
 The game refuses to shrink a grid below the slots that are currently in use, so empty the inventory out first if a smaller grid doesn't take.
 
@@ -49,8 +49,9 @@ Config is stored in `Plugins\config\BetterCheats.ini` and is generated on first 
 | `General` | `Enabled` | `true` | `true` or `false` -- enables the plugin |
 | `Menu` | `ToggleKey` | `F10` | Key to open / close the BetterCheats menu |
 | `Keybinds` | `NoClipKey` | `F9` | Key to toggle No Clip on / off without opening the menu |
+| `Keybinds` | `InventoryMaintainKey` | `Tab` | Key to apply the inventory grid size and slot scale for 3 seconds |
 
-Both keys can be rebound at runtime via the modloader's keybind settings, and the No Clip key can also be rebound from the **Player -> Movement** panel -- either way the change takes effect immediately and is written back to the .ini.
+These keys can be rebound at runtime via the modloader's keybind settings, and from the **Player -> Movement** / **Player -> Inventory** panels -- either way the change takes effect immediately and is written back to the .ini.
 
 ---
 
