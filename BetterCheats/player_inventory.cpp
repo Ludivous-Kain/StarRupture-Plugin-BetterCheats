@@ -1,9 +1,9 @@
 #include "player_inventory.h"
 #include "plugin_helpers.h"
-#include "plugin_config.h"
-#include "keybind_picker.h"
 #include "game_context.h"
 #include "session_config.h"
+
+#include <Windows.h>
 
 #include "Chimera_classes.hpp"
 #include "ChimeraUI_classes.hpp"
@@ -26,8 +26,9 @@
 // shrinking every slot widget by the same factor keeps the footprint. Do one
 // without the other and the grid overflows sideways instead of downwards.
 //
-// Resize and slot-scale maintain run only after the maintain keybind: immediately
-// on press, then every engine tick for a short burst. Steppers and the console
+// Resize and slot-scale maintain run only after Tab or E: immediately on the
+// game-thread tick that sees the down edge, then every engine tick for a short
+// burst. Other held keys do not block those edges. Steppers and the console
 // command only queue the wanted grid. Everything that touches a UObject runs on
 // the game thread — Tick(), or the console handler (gameThread = true).
 // RenderImGui() runs on the render thread and only ever reads the snapshot.
@@ -50,7 +51,7 @@ namespace BetterCheats::Panels::Inventory
 		// Neither half stays applied on its own: the game rebuilds every slot
 		// widget whenever the inventory resizes, so the sizes have to be put back
 		// afterwards, and the widgets only exist once the inventory is opened.
-		// The maintain keybind is the only thing that starts that work.
+		// Tab or E is the only thing that starts that work.
 		constexpr float kBurstSeconds = 3.0f;
 
 		constexpr const char* kCommandName  = "bc_invsize";
@@ -361,10 +362,10 @@ namespace BetterCheats::Panels::Inventory
 		std::atomic<bool> g_wantFitToPanel{ true };
 		std::atomic<bool> g_pendingResize{ false };
 
-		// Input thread writes this; Tick consumes it on the game thread so the
-		// first burst pass runs on the next engine tick rather than from the
-		// key callback (which is not safe for UObject traffic).
-		std::atomic<bool> g_burstRequested{ false };
+		// Rising-edge state for Tab/E, sampled in Tick so other held keys cannot
+		// swallow the press the way a named modloader combo would.
+		bool g_tabWasDown = false;
+		bool g_eWasDown   = false;
 
 		// ---------------------------------------------------------------------
 		// Applied state — game thread only.
@@ -600,7 +601,7 @@ namespace BetterCheats::Panels::Inventory
 				SessionConfig::Set("playerInventory.rows", rows);
 
 				console->Printf(sink, PluginConsoleLineKind::Output,
-					"Queued %d x %d (%d slots). Press the inventory maintain key to apply.",
+					"Queued %d x %d (%d slots). Press Tab or E to apply.",
 					columns, rows, columns * rows);
 			}
 			catch (...)
@@ -661,46 +662,41 @@ namespace BetterCheats::Panels::Inventory
 			return changed;
 		}
 
-		std::mutex g_keyMutex;
-		char       g_maintainKey[64] = "";
-
-		void ReadMaintainKey(char* out, size_t outSize)
+		bool IsGameForeground()
 		{
-			std::lock_guard<std::mutex> lock(g_keyMutex);
-			snprintf(out, outSize, "%s", g_maintainKey);
+			HWND foreground = GetForegroundWindow();
+			if (!foreground)
+				return false;
+
+			DWORD pid = 0;
+			GetWindowThreadProcessId(foreground, &pid);
+			return pid == GetCurrentProcessId();
 		}
 
-		void OnMaintainKeyPressed(EModKey /*key*/, EModKeyEvent /*event*/)
+		bool IsKeyHeld(int virtualKey)
 		{
+			return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+		}
+
+		// Always samples Tab/E so the edge state stays correct while the game
+		// is backgrounded or outside ChimeraMain. Only a fresh down edge starts
+		// a burst, and only when cheats are allowed in the foreground session.
+		bool ConsumeBurstKeyPress()
+		{
+			const bool tabDown = IsKeyHeld(VK_TAB);
+			const bool eDown   = IsKeyHeld('E');
+			const bool pressed = (tabDown && !g_tabWasDown) || (eDown && !g_eWasDown);
+			g_tabWasDown = tabDown;
+			g_eWasDown   = eDown;
+
+			if (!pressed)
+				return false;
+			if (!IsGameForeground())
+				return false;
 			if (!GameContext::IsInChimeraMain() || !GameContext::AreCheatsAllowed())
-				return;
+				return false;
 
-			g_burstRequested.store(true);
-		}
-
-		void ApplyMaintainKey(const char* combo)
-		{
-			IPluginSelf* self = GetSelf();
-			if (!self || !self->hooks || !self->hooks->Input || !combo || !*combo)
-				return;
-
-			char previous[64];
-			{
-				std::lock_guard<std::mutex> lock(g_keyMutex);
-				if (strcmp(g_maintainKey, combo) == 0)
-					return;
-
-				snprintf(previous, sizeof(previous), "%s", g_maintainKey);
-				snprintf(g_maintainKey, sizeof(g_maintainKey), "%s", combo);
-			}
-
-			if (previous[0])
-				self->hooks->Input->UnregisterKeybindByName(previous, EModKeyEvent::Pressed, &OnMaintainKeyPressed);
-
-			self->hooks->Input->RegisterKeybindByName(combo, EModKeyEvent::Pressed, &OnMaintainKeyPressed);
-			BetterCheatsConfig::Config::SetInventoryMaintainKey(combo);
-
-			LOG_INFO("Inventory: maintain keybind is now %s.", combo);
+			return true;
 		}
 	}
 
